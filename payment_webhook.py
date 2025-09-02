@@ -38,8 +38,8 @@ Optional env:
   EVENT_STORE_BACKEND (sqlite|memory; default sqlite)
   HTTP_TIMEOUT_SEC (default 10)
 
-Run:
-  uvicorn payment_webhook:app --host 0.0.0.0 --port 8080
+Run (Render auto-sets $PORT, don’t hardcode):
+  uvicorn payment_webhook:app --host 0.0.0.0 --port $PORT
 """
 
 from __future__ import annotations
@@ -76,6 +76,14 @@ app = FastAPI(title="Payments Webhook + Top-up")
 web_dir = os.path.join(os.path.dirname(__file__), "web")
 if os.path.isdir(web_dir):
     app.mount("/web", StaticFiles(directory=web_dir), name="web")
+
+@app.get("/")
+async def root():
+    return {"service": "payment_webhook", "ok": True}
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
 @app.get("/topup")
 async def topup_page():
@@ -299,6 +307,7 @@ async def stripe_create_checkout_session(request: Request):
     if not secret_key:
         raise HTTPException(status_code=500, detail="Missing STRIPE_SECRET_KEY")
 
+    # TIP: on Render set STRIPE_SUCCESS_URL to your public URL (don’t keep localhost)
     success_url = os.getenv("STRIPE_SUCCESS_URL", "http://localhost:8080/topup?status=success&sid={CHECKOUT_SESSION_ID}")
     cancel_url  = os.getenv("STRIPE_CANCEL_URL",  "http://localhost:8080/topup?status=cancel")
 
@@ -405,7 +414,9 @@ def _extract_from_charge(obj: Dict[str, Any]) -> Tuple[Optional[str], Optional[i
         amount_minor = None
     return txid, amount_minor, currency, provider_txn_id
 
+# register the handler under BOTH paths: /webhook/stripe and /webhook
 @app.post("/webhook/stripe")
+@app.post("/webhook")
 async def webhook_stripe(request: Request, background: BackgroundTasks):
     raw = await request.body()
     sig = request.headers.get("Stripe-Signature")
