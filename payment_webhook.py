@@ -9,7 +9,7 @@ This service calls your main backend over HTTP for:
 Internal API contracts (implement on main backend):
 - POST {BACKEND_BASE_URL}/internal/topups/request
   Payload JSON: {
-    "user": {"Username": "-"},
+    "user": {"Username": "<username or '-'>"},
     "amount": <float THB>,
     "method": "Stripe/Checkout",
     "description": "Top-up"  // optional
@@ -19,20 +19,21 @@ Internal API contracts (implement on main backend):
 - POST {BACKEND_BASE_URL}/internal/topups/mark-paid
   Payload JSON: {
     "txid": "XXXXXX",
-    "amount": <float THB | null>,  // can be null if not known
+    "amount": <float THB | null>,
     "provider": "Stripe",
     "provider_txn_id": "pi_xxx or ch_xxx"
   }
-  Response JSON: { "ok": true }  (treat any non-2xx or ok!=true as failure)
+  Response JSON: { "ok": true }
 
 Required env:
   STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, STRIPE_WEBHOOK_SECRET
-  BACKEND_BASE_URL, INTERNAL_AUTH_SECRET  // for calling main backend
+  BACKEND_BASE_URL, INTERNAL_AUTH_SECRET
 
 Optional env:
   STRIPE_SUCCESS_URL, STRIPE_CANCEL_URL
   ALLOWED_CURRENCIES (default "thb")
   MIN_TOPUP_THB (default 20.0), MAX_TOPUP_THB (default 50000.0)
+  ALLOWED_AMOUNTS (comma list, e.g. "1500,2500,3500")
   STRICT_AMOUNT_MATCH (default true), ON_MISMATCH (log_only|reject; default log_only)
   CORS_ALLOW_ORIGINS (comma list)
   EVENT_STORE_BACKEND (sqlite|memory; default sqlite)
@@ -51,7 +52,7 @@ import hashlib
 import logging
 import sqlite3
 from uuid import uuid4
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Set
 
 import requests
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -131,6 +132,18 @@ def _int_env(name: str, default: int) -> int:
     except Exception:
         return default
 
+def _parse_amount_set(s: str) -> Set[float]:
+    out: Set[float] = set()
+    for part in (s or "").split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            out.add(round(float(p), 2))
+        except Exception:
+            pass
+    return out
+
 # -----------------------------------------------------------------------------
 # Idempotency store (sqlite default; memory fallback)
 # -----------------------------------------------------------------------------
@@ -199,13 +212,11 @@ if not _BACKEND_BASE_URL:
 if not _INTERNAL_AUTH_SECRET:
     log.warning("INTERNAL_AUTH_SECRET not set; calls to backend will likely be unauthorized")
 
-
 def _auth_headers() -> Dict[str, str]:
     h = {"Content-Type": "application/json"}
     if _INTERNAL_AUTH_SECRET:
         h["X-Internal-Auth"] = _INTERNAL_AUTH_SECRET
     return h
-
 
 def backend_record_topup_request(user: Dict[str, Any], amount_baht: float, method: str, description: str) -> Optional[str]:
     if not _BACKEND_BASE_URL:
@@ -228,7 +239,6 @@ def backend_record_topup_request(user: Dict[str, Any], amount_baht: float, metho
     except Exception as e:
         log.warning("record_topup_request call failed: %s", e)
         return None
-
 
 def backend_update_topup_status_paid(txid: str, amount_baht: Optional[float], provider: str, provider_txn_id: str) -> bool:
     if not _BACKEND_BASE_URL:
@@ -262,13 +272,20 @@ async def stripe_pubkey():
 # -----------------------------------------------------------------------------
 # Stripe: create Checkout Session (variable amount top-up)
 # -----------------------------------------------------------------------------
+def _allowed_amounts() -> Set[float]:
+    return _parse_amount_set(os.getenv("ALLOWED_AMOUNTS", "1500,2500,3500"))
+
 @app.post("/api/stripe/create-checkout-session")
 async def stripe_create_checkout_session(request: Request):
     """
     Expects JSON:
-      { "amount": <int minor units>, "currency": "thb", "description": "Top-up" }
+      {
+        "amount": <int minor units>, "currency": "thb", "description": "Top-up",
+        "username": "<optional username>", "client_txid": "<optional>"
+      }
     """
     body = await request.json()
+
     # amount (minor units)
     try:
         amount_minor = int(body.get("amount") or 0)
@@ -277,10 +294,12 @@ async def stripe_create_checkout_session(request: Request):
 
     currency = str(body.get("currency") or "").lower() or "thb"
     description = str(body.get("description") or "Top-up")
+    username = str(body.get("username") or "-").strip() or "-"
+    client_txid = str(body.get("client_txid") or "").strip() or None
 
-    # Safety: whitelist currency + min/max range
-    allowed = {c.strip().lower() for c in os.getenv("ALLOWED_CURRENCIES", "thb").split(",")}
-    if currency not in allowed:
+    # Safety: whitelist currency + min/max range + allowlist
+    allowed_currencies = {c.strip().lower() for c in os.getenv("ALLOWED_CURRENCIES", "thb").split(",")}
+    if currency not in allowed_currencies:
         raise HTTPException(status_code=400, detail="unsupported currency")
 
     min_thb = _float_env("MIN_TOPUP_THB", 20.0)
@@ -293,10 +312,17 @@ async def stripe_create_checkout_session(request: Request):
     if not (min_minor <= amount_minor <= max_minor):
         raise HTTPException(status_code=400, detail=f"amount out of bounds ({min_thb}-{max_thb} THB)")
 
-    # Create TxID via backend & record expected amount
+    # strict allowlist (e.g. 1500, 2500, 3500)
+    allowset = _allowed_amounts()
+    amount_baht = round(amount_minor / 100.0, 2)
+    if allowset and amount_baht not in allowset:
+        allowed_str = ", ".join(str(int(a)) if a.is_integer() else str(a) for a in sorted(allowset))
+        raise HTTPException(status_code=400, detail=f"amount must be one of {{{allowed_str}}}")
+
+    # Create TxID via backend & record expected amount (attach username)
     txid: Optional[str] = None
     try:
-        txid = backend_record_topup_request({"Username": "-"}, amount_minor / 100.0, "Stripe/Checkout", description)
+        txid = backend_record_topup_request({"Username": username}, amount_baht, "Stripe/Checkout", description)
     except Exception:
         txid = None
     if not txid:
@@ -307,7 +333,7 @@ async def stripe_create_checkout_session(request: Request):
     if not secret_key:
         raise HTTPException(status_code=500, detail="Missing STRIPE_SECRET_KEY")
 
-    # TIP: on Render set STRIPE_SUCCESS_URL to your public URL (don’t keep localhost)
+    # TIP: on Render set STRIPE_SUCCESS_URL to your public URL
     success_url = os.getenv("STRIPE_SUCCESS_URL", "http://localhost:8080/topup?status=success&sid={CHECKOUT_SESSION_ID}")
     cancel_url  = os.getenv("STRIPE_CANCEL_URL",  "http://localhost:8080/topup?status=cancel")
 
@@ -317,7 +343,10 @@ async def stripe_create_checkout_session(request: Request):
         "expected_amount_minor": str(amount_minor),
         "expected_currency": currency,
         "origin": "server",
+        "username": username,
     }
+    if client_txid:
+        metadata["client_txid"] = client_txid
 
     session_id: Optional[str] = None
     session_url: Optional[str] = None
@@ -361,11 +390,21 @@ async def stripe_create_checkout_session(request: Request):
             "metadata[expected_amount_minor]": metadata["expected_amount_minor"],
             "metadata[expected_currency]": metadata["expected_currency"],
             "metadata[origin]": "server",
+            "metadata[username]": metadata["username"],
+        }
+        if client_txid:
+            data["metadata[client_txid]"] = client_txid
+        # Duplicate metadata to PaymentIntent too
+        data.update({
             "payment_intent_data[metadata][txid]": metadata["txid"],
             "payment_intent_data[metadata][expected_amount_minor]": metadata["expected_amount_minor"],
             "payment_intent_data[metadata][expected_currency]": metadata["expected_currency"],
             "payment_intent_data[metadata][origin]": "server",
-        }
+            "payment_intent_data[metadata][username]": metadata["username"],
+        })
+        if client_txid:
+            data["payment_intent_data[metadata][client_txid]"] = client_txid
+
         resp = requests.post(url, data=data, auth=(secret_key, ""), timeout=_HTTP_TIMEOUT)
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
@@ -486,6 +525,18 @@ async def webhook_stripe(request: Request, background: BackgroundTasks):
             return JSONResponse({"ok": False, "reason": "amount_mismatch"}, status_code=200)
         else:
             log.warning("LOG_ONLY %s", msg)
+
+    # Additional allowlist enforcement (defense in depth)
+    allowset = _allowed_amounts()
+    if amount_minor is not None and allowset:
+        amt_baht = round(amount_minor / 100.0, 2)
+        if amt_baht not in allowset:
+            msg = f"amount {amt_baht} not in allowlist {sorted(allowset)} (txid={txid})"
+            if on_mismatch == "reject":
+                log.warning("REJECT %s", msg)
+                return JSONResponse({"ok": False, "reason": "amount_not_allowed"}, status_code=200)
+            else:
+                log.warning("LOG_ONLY %s", msg)
 
     # Convert to baht
     amount_baht: Optional[float] = None
