@@ -1,6 +1,6 @@
 # payment_webhook.py
 """
-FastAPI webhook server for top-ups via Stripe only (no local utils dependency).
+FastAPI webhook server for top-ups via Stripe.
 
 This service calls your main backend over HTTP for:
 - Creating top-up records and TxID
@@ -34,6 +34,7 @@ Optional env:
   ALLOWED_CURRENCIES (default "thb")
   MIN_TOPUP_THB (default 20.0), MAX_TOPUP_THB (default 50000.0)
   ALLOWED_AMOUNTS (comma list, e.g. "1500,2500,3500")
+  PAYMENT_METHOD_TYPES (comma list, default "card,promptpay,truemoney")
   STRICT_AMOUNT_MATCH (default true), ON_MISMATCH (log_only|reject; default log_only)
   CORS_ALLOW_ORIGINS (comma list)
   EVENT_STORE_BACKEND (sqlite|memory; default sqlite)
@@ -143,6 +144,13 @@ def _parse_amount_set(s: str) -> Set[float]:
         except Exception:
             pass
     return out
+
+def _parse_list_env(name: str, default_csv: str) -> list[str]:
+    return [x.strip() for x in os.getenv(name, default_csv).split(",") if x.strip()]
+
+def _payment_methods() -> list[str]:
+    # เปิดการชำระหลายแบบได้จาก ENV; ค่าเริ่มต้น: บัตร + PromptPay + TrueMoney
+    return _parse_list_env("PAYMENT_METHOD_TYPES", "card,promptpay,truemoney")
 
 # -----------------------------------------------------------------------------
 # Idempotency store (sqlite default; memory fallback)
@@ -357,7 +365,6 @@ async def stripe_create_checkout_session(request: Request):
         stripe.api_key = secret_key
         session = stripe.checkout.Session.create(
             mode="payment",
-            payment_method_types=["card"],
             line_items=[{
                 "price_data": {
                     "currency": currency,
@@ -366,46 +373,51 @@ async def stripe_create_checkout_session(request: Request):
                 },
                 "quantity": 1,
             }],
+            # ✅ enable multiple payment methods (card/promptpay/truemoney) from ENV
+            payment_method_types=_payment_methods(),
             metadata=metadata,
             payment_intent_data={"metadata": metadata},
             success_url=success_url,
             cancel_url=cancel_url,
+            locale="th",
         )
         session_id = session.get("id")
         session_url = session.get("url")
     except Exception as e:
-        # Fallback REST
+        # Fallback REST (form-encoded). Must pass payment_method_types[] multiple times.
         log.warning("Stripe SDK failed (%s), using REST fallback", e)
-        url = "https://api.stripe.com/v1/checkout/sessions"
-        data = {
-            "mode": "payment",
-            "payment_method_types[]": "card",
-            "success_url": success_url,
-            "cancel_url": cancel_url,
-            "line_items[0][price_data][currency]": currency,
-            "line_items[0][price_data][product_data][name]": description,
-            "line_items[0][price_data][unit_amount]": str(amount_minor),
-            "line_items[0][quantity]": "1",
-            "metadata[txid]": metadata["txid"],
-            "metadata[expected_amount_minor]": metadata["expected_amount_minor"],
-            "metadata[expected_currency]": metadata["expected_currency"],
-            "metadata[origin]": "server",
-            "metadata[username]": metadata["username"],
-        }
-        if client_txid:
-            data["metadata[client_txid]"] = client_txid
-        # Duplicate metadata to PaymentIntent too
-        data.update({
-            "payment_intent_data[metadata][txid]": metadata["txid"],
-            "payment_intent_data[metadata][expected_amount_minor]": metadata["expected_amount_minor"],
-            "payment_intent_data[metadata][expected_currency]": metadata["expected_currency"],
-            "payment_intent_data[metadata][origin]": "server",
-            "payment_intent_data[metadata][username]": metadata["username"],
-        })
-        if client_txid:
-            data["payment_intent_data[metadata][client_txid]"] = client_txid
 
-        resp = requests.post(url, data=data, auth=(secret_key, ""), timeout=_HTTP_TIMEOUT)
+        methods = _payment_methods()
+        data = [
+            ("mode", "payment"),
+            ("success_url", success_url),
+            ("cancel_url", cancel_url),
+            ("line_items[0][price_data][currency]", currency),
+            ("line_items[0][price_data][product_data][name]", description),
+            ("line_items[0][price_data][unit_amount]", str(amount_minor)),
+            ("line_items[0][quantity]", "1"),
+            # metadata
+            ("metadata[txid]", metadata["txid"]),
+            ("metadata[expected_amount_minor]", metadata["expected_amount_minor"]),
+            ("metadata[expected_currency]", metadata["expected_currency"]),
+            ("metadata[origin]", "server"),
+            ("metadata[username]", metadata["username"]),
+            # duplicate metadata onto PaymentIntent
+            ("payment_intent_data[metadata][txid]", metadata["txid"]),
+            ("payment_intent_data[metadata][expected_amount_minor]", metadata["expected_amount_minor"]),
+            ("payment_intent_data[metadata][expected_currency]", metadata["expected_currency"]),
+            ("payment_intent_data[metadata][origin]", "server"),
+            ("payment_intent_data[metadata][username]", metadata["username"]),
+        ]
+        if client_txid:
+            data.append(("metadata[client_txid]", client_txid))
+            data.append(("payment_intent_data[metadata][client_txid]", client_txid))
+
+        for m in methods:
+            data.append(("payment_method_types[]", m))
+
+        resp = requests.post("https://api.stripe.com/v1/checkout/sessions",
+                             data=data, auth=(secret_key, ""), timeout=_HTTP_TIMEOUT)
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         j = resp.json()
